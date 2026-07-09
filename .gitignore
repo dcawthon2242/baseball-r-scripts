@@ -1,0 +1,14 @@
+# macOS junk (from files synced/copied from a Mac)
+.DS_Store
+._*
+
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user/
+
+# Cached/downloaded data (regenerate with the download scripts)
+Swing Emulation/data/
+
+# Too large for GitHub (1GB)
+Pitch Grade Models/D1TM_Combined_with_StuffPlus.rds

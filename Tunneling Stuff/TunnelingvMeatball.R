@@ -1,0 +1,2 @@
+mlb_tunneling = mutate(stats_4, FBSLVeloDiff = fastball_avg_speed - sl_avg_speed, FBSLHMovDiff = fastball_avg_break_x - sl_avg_break_x, FBSLVMovDiff = fastball_avg_break_z - sl_avg_break_z, FBCHVeloDiff = fastball_avg_speed - ch_avg_speed, FBCHHMovDiff = fastball_avg_break_x - ch_avg_break_x, FBCHVMovDiff = fastball_avg_break_z - ch_avg_break_z, FBCUVeloDiff = fastball_avg_speed - cu_avg_speed, FBCUHMovDiff = fastball_avg_break_x - cu_avg_break_x, FBCUVMovDiff = fastball_avg_break_z - cu_avg_break_z)
+filter(mlb_tunneling, FBSLVeloDiff = )
