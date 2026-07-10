@@ -43,10 +43,10 @@ reconstruct_bat_path <- function(bat_speed, swing_length, attack_angle,
   # sin(tau)^2 = sin(alpha)^2 + sin(beta)^2
   sin_beta <- sqrt(pmax(sin(tau)^2 - sin(alpha)^2, 0))
   # horizontal direction of w: perpendicular to v_hat's horizontal projection,
-  # signed so w points toward the catcher (-y)
+  # signed so the hands sit on the batter's pull side (RHH: -x, LHH: +x)
   h <- c(v_hat[1], v_hat[2], 0) / sqrt(v_hat[1]^2 + v_hat[2]^2)
   perp <- c(-h[2], h[1], 0)
-  if (perp[2] > 0) perp <- -perp
+  if (sign(perp[1]) != pull) perp <- -perp
   w <- c(perp[1] * sqrt(1 - sin_beta^2), perp[2] * sqrt(1 - sin_beta^2), sin_beta)
   # orthogonalize against v_hat (guards small numeric drift), renormalize
   w <- w - sum(w * v_hat) * v_hat
@@ -74,12 +74,12 @@ reconstruct_bat_path <- function(bat_speed, swing_length, attack_angle,
 pitch_flight <- function(vx0, vy0, vz0, ax, ay, az,
                          y0 = 50, yf = 17 / 12, n_points = 60) {
   t_end <- (-sqrt(vy0^2 + 2 * ay * (yf - y0)) - vy0) / ay
-  t <- seq(0, t_end, length.out = n_points)
+  tt <- seq(0, t_end, length.out = n_points)      # time since the y = 50 mark
   tibble(
-    t = t - t_end,                                  # t = 0 at plate crossing
-    x = vx0 * t + 0.5 * ax * t^2,
-    y = y0 + vy0 * t + 0.5 * ay * t^2,
-    z = vz0 * t + 0.5 * az * t^2
+    t = tt - t_end,                               # t = 0 at plate crossing
+    x = vx0 * tt + 0.5 * ax * tt^2,
+    y = y0 + vy0 * tt + 0.5 * ay * tt^2,
+    z = vz0 * tt + 0.5 * az * tt^2
   ) |>
     mutate(x = x - last(x), z = z - last(z))
 }
@@ -118,7 +118,7 @@ plot_emulated_swing <- function(em, title) {
     geom_path(data = ball, linewidth = 1) +
     geom_path(data = bat, linewidth = 1) +
     geom_point(data = slice_tail(bat, n = 1), size = 3) +
-    coord_equal(xlim = c(-1, 12)) +
+    coord_equal(xlim = c(-5, 12)) +
     labs(title = title, subtitle = "side view (catcher to the left)",
          x = "y: distance from plate (ft)", y = "height (ft)") +
     theme_minimal()
@@ -127,7 +127,7 @@ plot_emulated_swing <- function(em, title) {
     geom_path(data = ball, linewidth = 1) +
     geom_path(data = bat, linewidth = 1) +
     geom_point(data = slice_tail(bat, n = 1), size = 3) +
-    coord_equal(xlim = c(-1, 12)) +
+    coord_equal(xlim = c(-5, 12)) +
     labs(subtitle = "top view",
          x = "y: distance from plate (ft)", y = "x: first-base side (ft)") +
     theme_minimal()
@@ -140,11 +140,12 @@ if (sys.nframe() == 0) {
   md <- readRDS(file.path(data_dir, "model_data.rds"))
 
   # two contrasting example pitches: a center-cut four-seamer and a low slider
+  # dplyr::slice explicitly -- xgboost masks it
   ff <- md |> filter(pitch_type == "FF", abs(plate_x) < 0.3,
                      plate_z_rel > 0.45, plate_z_rel < 0.55, release_speed > 94) |>
-    slice(1)
+    dplyr::slice(1)
   sl <- md |> filter(pitch_type == "SL", plate_z_rel < 0.25, release_speed > 84) |>
-    slice(1)
+    dplyr::slice(1)
 
   for (ex in list(list(row = ff, name = "95mph_four_seam_middle"),
                   list(row = sl, name = "slider_low"))) {
