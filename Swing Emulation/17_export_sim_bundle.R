@@ -20,6 +20,8 @@ traj <- raw |>
   filter(!is.na(vx0), !is.na(plate_x), pitch_type %in% names(PT_NAMES)) |>
   group_by(pitcher, pitch_type) |>
   summarise(n = n(), throws = names(which.max(table(p_throws))),
+            px_sd = sd(plate_x, na.rm = TRUE), pz_sd = sd(plate_z, na.rm = TRUE),
+            spd_sd = sd(release_speed, na.rm = TRUE),
             across(c(release_pos_x, release_pos_y, release_pos_z, vx0, vy0, vz0,
                      ax, ay, az, release_speed, plate_x, plate_z), ~ mean(.x, na.rm = TRUE)),
             .groups = "drop") |>
@@ -48,7 +50,8 @@ pitchers_json <- traj |>
     rel = pmap(list(release_pos_x, release_pos_y, release_pos_z), ~ round(c(...), 3)),
     v = pmap(list(vx0, vy0, vz0), ~ round(c(...), 3)),
     a = pmap(list(ax, ay, az), ~ round(c(...), 3)),
-    speed = round(release_speed, 1), plate = pmap(list(plate_x, plate_z), ~ round(c(...), 3))
+    speed = round(release_speed, 1), plate = pmap(list(plate_x, plate_z), ~ round(c(...), 3)),
+    sd = pmap(list(px_sd, pz_sd, spd_sd), ~ round(c(...), 3))
   )), .groups = "drop") |>
   arrange(name)
 
@@ -62,9 +65,27 @@ swingnet <- nn_module("swingnet",
 net <- torch_load(file.path(model_dir, "player_embed_net.pt"))
 sd <- net$state_dict(); W <- function(k) round(as.array(sd[[k]]$cpu()), 5)
 
+variety <- readRDS(file.path(model_dir, "swing_variety.rds"))
 hitters_json <- meta$batter_key |>
-  transmute(name = player_name, stand, idx = b_idx - 1) |>   # 0-based for JS
+  left_join(variety$hit_scale, by = "b_idx") |>
+  transmute(name = player_name, stand, idx = b_idx - 1,      # 0-based for JS
+            vscale = round(coalesce(scale, 1), 3)) |>
   arrange(name)
+
+# contact DEPTH model: how far in front of the plate the barrel meets the ball,
+# as a function of pitch location + speed (inside pitches are met out front,
+# away pitches deeper). intercept_y is inches relative to the batter's center
+# of mass, so we export deviations-from-mean; the JS anchors the mean depth.
+sw_depth <- readRDS(file.path(data_dir, "swings_all.rds")) |>
+  mutate(px_in = if_else(stand == "R", -plate_x, plate_x)) |>
+  filter(!is.na(intercept_y), !is.na(px_in), !is.na(plate_z_rel), !is.na(release_speed))
+dfit <- lm(intercept_y ~ px_in + plate_z_rel + release_speed, data = sw_depth)
+depth_json <- list(coef = round(coef(dfit)[-1], 4),
+                   means = round(c(px_in = mean(sw_depth$px_in),
+                                   plate_z_rel = mean(sw_depth$plate_z_rel),
+                                   release_speed = mean(sw_depth$release_speed)), 4),
+                   resid_sd_in = round(sd(resid(dfit)), 2))
+cat("depth model coefs (in/unit):", paste(names(coef(dfit)[-1]), round(coef(dfit)[-1],2), collapse=", "), "\n")
 
 bundle <- list(
   pitchers = pitchers_json,
@@ -76,7 +97,9 @@ bundle <- list(
   metrics = c("bat_speed","swing_length","attack_angle","attack_direction","swing_path_tilt"),
   fmean = round(meta$fmean, 5), fsd = round(meta$fsd, 5),
   tmean = round(meta$tmean, 5), tsd = round(meta$tsd, 5),
-  bat_radius = 2.57
+  bat_radius = 2.57,
+  sigma = round(unname(variety$Sigma), 4),   # 5x5 swing-to-swing covariance
+  depth = depth_json
 )
 write_json(bundle, file.path(web_dir, "sim_bundle.json"), auto_unbox = TRUE, digits = 5)
 cat("wrote sim_bundle.json (", round(file.size(file.path(web_dir, "sim_bundle.json"))/1024), "KB), ",

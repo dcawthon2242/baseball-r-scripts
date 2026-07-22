@@ -34,11 +34,13 @@
     backdrop-filter:blur(6px); font-family:ui-monospace,"SF Mono","Cascadia Code",Consolas,monospace}
   .hud .match{font-size:12.5px; color:var(--ink); margin-bottom:8px; line-height:1.5}
   .hud .match b{color:var(--chalk); font-weight:600}
-  .hud .pitchline{display:flex; align-items:baseline; gap:8px; margin-bottom:10px}
+  .hud .pitchline{display:flex; align-items:baseline; gap:8px; margin-bottom:6px}
   .hud .velo{color:var(--ball); font-size:22px; font-weight:600; font-variant-numeric:tabular-nums}
   .hud .ptype{color:var(--ink); font-size:13px} .hud .zone{margin-left:auto; font-size:10.5px;
     letter-spacing:.1em; text-transform:uppercase; padding:2px 7px; border-radius:5px}
   .zone.in{background:rgba(55,207,224,.16); color:var(--ball)} .zone.out{background:rgba(242,145,61,.16); color:var(--bat)}
+  .outcome{font-size:12px; min-height:17px; margin-bottom:8px; letter-spacing:.04em}
+  .outcome.whiff{color:#e2564d} .outcome.hit{color:#65d98d} .outcome.idle{color:var(--dim)}
   .hud .grid{display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; border-top:1px solid var(--line); padding-top:9px}
   .hud .cell{display:flex; flex-direction:column}
   .hud .k{font-size:9.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--dim)}
@@ -69,6 +71,7 @@
     <div class="match" id="match"></div>
     <div class="pitchline"><span class="velo" id="velo">--</span><span class="ptype" id="ptype">mph</span>
       <span class="zone out" id="zone">—</span></div>
+    <div class="outcome idle" id="outcome">every pitch + swing is re-sampled — press PITCH</div>
     <div class="swlab">emulated swing</div>
     <div class="grid" id="sw"></div>
   </div>
@@ -83,6 +86,8 @@ const BUNDLE = __BUNDLE__;
 (function(){
   const B = BUNDLE, net = B.net;
   const YF = 17/12, RUBBER = 60.5, ZX = 0.83, ZB = 1.6, ZT = 3.4;
+  const BALL_R = 0.121, BARREL_R = 0.11, HIT_TOL = BALL_R + BARREL_R; // ft
+  const AIM_SD_IN = 0.185, AIM_SD_OUT = 0.28;                         // vertical barrel error (ft)
   const sim = document.getElementById('sim'), cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 
   // ---------- math ----------
@@ -92,6 +97,13 @@ const BUNDLE = __BUNDLE__;
   const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
   const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
   const norm=a=>{const n=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/n,a[1]/n,a[2]/n];};
+  function randn(){let u=0,v=0; while(!u)u=Math.random(); while(!v)v=Math.random();
+    return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
+  function chol(A){const n=A.length,L=A.map(r=>r.map(()=>0));
+    for(let i=0;i<n;i++)for(let j=0;j<=i;j++){let s=A[i][j];
+      for(let k=0;k<j;k++)s-=L[i][k]*L[j][k];
+      L[i][j]= i===j?Math.sqrt(Math.max(s,1e-9)):s/L[j][j];} return L;}
+  const SIG_L = chol(B.sigma);
 
   // ---------- swing prediction (embedding net) ----------
   function predictSwing(pitch, hitter, throws){
@@ -104,8 +116,40 @@ const BUNDLE = __BUNDLE__;
     const out={}; B.metrics.forEach((m,i)=>out[m]=o[i]*B.tsd[i]+B.tmean[i]);
     return out;
   }
+  function sampleSwing(mu, vscale){
+    const z=[randn(),randn(),randn(),randn(),randn()];
+    const d=SIG_L.map(row=>row.reduce((s,v,j)=>s+v*z[j],0));
+    const m={}; B.metrics.forEach((k,i)=>m[k]=mu[k]+vscale*d[i]);
+    m.bat_speed=Math.max(45,Math.min(90,m.bat_speed));
+    m.swing_length=Math.max(4.2,Math.min(10.5,m.swing_length));
+    m.swing_path_tilt=Math.max(6,Math.min(58,m.swing_path_tilt));
+    return m;
+  }
 
-  // ---------- bat sweet-spot arc (ported from reconstruction, OBP-calibrated) ----------
+  // ---------- pitch sampling & flight ----------
+  function samplePitch(pt){
+    const f0=pitchFlight(pt), span=f0.tP-f0.tR;
+    const sd=pt.sd||[0.28,0.28,0.9];
+    const dx=randn()*sd[0], dz=randn()*sd[1], ds=randn()*Math.min(sd[2],1.6);
+    const s=(pt.speed+ds)/pt.speed;
+    return Object.assign({}, pt, {
+      speed:+(pt.speed+ds).toFixed(1),
+      plate:[pt.plate[0]+dx, pt.plate[1]+dz],
+      v:[(pt.v[0]+dx/span)*s, pt.v[1]*s, (pt.v[2]+dz/span)*s]
+    });
+  }
+  function pitchFlight(p){
+    const [vx0,vy0,vz0]=p.v,[ax,ay,az]=p.a, y0=50;
+    const tAt = y => (-Math.sqrt(Math.max(vy0*vy0+2*ay*(y-y0),0))-vy0)/ay;
+    const tP=tAt(YF);
+    const x50=p.plate[0]-(vx0*tP+0.5*ax*tP*tP), z50=p.plate[1]-(vz0*tP+0.5*az*tP*tP);
+    const yRel=p.rel[1], A=0.5*ay, Bb=vy0, Cc=y0-yRel, disc=Math.sqrt(Bb*Bb-4*A*Cc);
+    const tR=Math.min((-Bb+disc)/(2*A), (-Bb-disc)/(2*A));
+    const pos=t=>[x50+vx0*t+0.5*ax*t*t, y0+vy0*t+0.5*ay*t*t, z50+vz0*t+0.5*az*t*t];
+    return {pos, tAt, tR, tP};
+  }
+
+  // ---------- bat arc (OBP-calibrated) with follow-through ----------
   function reconstructBat(m, contact, stand){
     const R=B.bat_radius, a=m.attack_angle*Math.PI/180, d=m.attack_direction*Math.PI/180;
     const tau=Math.max(m.swing_path_tilt*Math.PI/180, Math.abs(a)+1e-6), pull= stand==="R"?-1:1;
@@ -115,29 +159,35 @@ const BUNDLE = __BUNDLE__;
     let perp=[-h[1],h[0],0]; if(Math.sign(perp[0])!==pull) perp=[-perp[0],-perp[1],0];
     let w=[perp[0]*Math.sqrt(1-sinB*sinB), perp[1]*Math.sqrt(1-sinB*sinB), sinB];
     const wd=dot(w,vh); w=norm([w[0]-wd*vh[0],w[1]-wd*vh[1],w[2]-wd*vh[2]]);
-    const theta=m.swing_length/R, C=[contact[0]+R*w[0],contact[1]+R*w[1],contact[2]+R*w[2]], N=48;
-    const pts=[], spd=[]; const vc=m.bat_speed*1.466667, seg=m.swing_length/(N-1);
-    for(let i=0;i<N;i++){ const phi=-theta+theta*i/(N-1);
-      pts.push([C[0]+R*(-Math.cos(phi)*w[0]+Math.sin(phi)*vh[0]),
-                C[1]+R*(-Math.cos(phi)*w[1]+Math.sin(phi)*vh[1]),
-                C[2]+R*(-Math.cos(phi)*w[2]+Math.sin(phi)*vh[2])]);
+    const theta=m.swing_length/R, C=[contact[0]+R*w[0],contact[1]+R*w[1],contact[2]+R*w[2]];
+    const N=48, EXT=14, FT_ANG=0.85;
+    const pts=[], spd=[], vc=m.bat_speed*1.466667, seg=m.swing_length/(N-1);
+    const at=phi=>[C[0]+R*(-Math.cos(phi)*w[0]+Math.sin(phi)*vh[0]),
+                   C[1]+R*(-Math.cos(phi)*w[1]+Math.sin(phi)*vh[1]),
+                   C[2]+R*(-Math.cos(phi)*w[2]+Math.sin(phi)*vh[2])];
+    for(let i=0;i<N;i++){ pts.push(at(-theta+theta*i/(N-1)));
       spd.push(vc*(0.12+0.88*Math.pow(i/(N-1),1.9))); }
     const t=[0]; for(let i=1;i<N;i++) t.push(t[i-1]+seg/((spd[i-1]+spd[i])/2));
-    const tmax=t[N-1]; return {pts, t:t.map(v=>v-tmax)};   // t: -dur..0 (0 at contact)
+    const tmax=t[N-1];
+    for(let i=1;i<=EXT;i++){ pts.push(at(FT_ANG*i/EXT));       // follow-through
+      t.push(tmax + (FT_ANG*R)*(i/EXT)/vc); }
+    return {pts, t:t.map(v=>v-tmax), contactIdx:N-1};
   }
 
-  // ---------- pitch flight from the 9 params ----------
-  function pitchFlight(p){
-    const [vx0,vy0,vz0]=p.v,[ax,ay,az]=p.a, y0=50;
-    const vyf=-Math.sqrt(vy0*vy0+2*ay*(YF-y0)), tP=(vyf-vy0)/ay;
-    const x50=p.plate[0]-(vx0*tP+0.5*ax*tP*tP), z50=p.plate[1]-(vz0*tP+0.5*az*tP*tP);
-    const yRel=p.rel[1], A=0.5*ay, Bb=vy0, Cc=y0-yRel, disc=Math.sqrt(Bb*Bb-4*A*Cc);
-    const r1=(-Bb+disc)/(2*A), r2=(-Bb-disc)/(2*A), tR=Math.min(r1,r2);
-    const pos=t=>[x50+vx0*t+0.5*ax*t*t, y0+vy0*t+0.5*ay*t*t, z50+vz0*t+0.5*az*t*t];
-    return {pos, tR, tP, contact:[p.plate[0],YF,p.plate[1]]};
+  // ---------- contact depth (fit on Statcast intercept data) ----------
+  const DEPTH_ANCHOR = 1.55;   // ft in front of plate tip at league-average conditions
+  function contactDepth(pitch, stand){
+    const px_in = stand==="R" ? -pitch.plate[0] : pitch.plate[0];
+    const f=[px_in, (pitch.plate[1]-1.6)/1.8, pitch.speed];
+    const KEYS=['px_in','plate_z_rel','release_speed'];
+    const c=Array.isArray(B.depth.coef)?B.depth.coef:KEYS.map(k=>B.depth.coef[k]);
+    const mns=Array.isArray(B.depth.means)?B.depth.means:KEYS.map(k=>B.depth.means[k]);
+    let dev=0; KEYS.forEach((k,i)=>dev+=c[i]*(f[i]-mns[i]));
+    dev += randn()*B.depth.resid_sd_in*0.45;
+    return Math.max(0.5, Math.min(3.6, DEPTH_ANCHOR + dev/12));
   }
 
-  // ---------- camera / projection (world = Statcast: x right, y toward mound, z up) ----------
+  // ---------- camera ----------
   const cam = {az:-Math.PI/2, el:0.20, dist:30, target:[0,7,2.6]};
   function project(P){
     const cp=[cam.target[0]+cam.dist*Math.cos(cam.el)*Math.cos(cam.az),
@@ -159,18 +209,14 @@ const BUNDLE = __BUNDLE__;
 
   // ---------- static scene ----------
   function drawField(){
-    poly([[-46,-6,0],[46,-6,0],[46,80,0],[-46,80,0]], '#16301f');           // grass
+    poly([[-46,-6,0],[46,-6,0],[46,80,0],[-46,80,0]], '#16301f');
     for(let gy=0;gy<=70;gy+=10) line([-46,gy,0],[46,gy,0],'rgba(255,255,255,.03)',1);
-    // infield dirt
     poly([[0,0,0],[17,17,0],[0,34,0],[-17,17,0]], '#6b3f24');
     poly([[-9,55,.001],[9,55,.001],[9,66,.001],[-9,66,.001]], '#6b3f24');
-    // foul lines
     line([0,0,0],[38,42,0],'rgba(233,230,220,.5)',2); line([0,0,0],[-38,42,0],'rgba(233,230,220,.5)',2);
-    // home plate
-    poly([[-.71,0,.02],[.71,0,.02],[.71,.71,.02],[0,1.42,.02],[-.71,.71,.02]], '#dcd8cc');
-    // rubber
+    // home plate: flat front edge faces the pitcher, point faces the catcher
+    poly([[-.71,YF,.02],[.71,YF,.02],[.71,.71,.02],[0,0,.02],[-.71,.71,.02]], '#dcd8cc');
     poly([[-1,RUBBER-.1,.03],[1,RUBBER-.1,.03],[1,RUBBER+.1,.03],[-1,RUBBER+.1,.03]], '#dcd8cc');
-    // strike zone (front plane box outline)
     const zy=YF, cyan='rgba(55,207,224,.55)';
     const c=[[-ZX,zy,ZB],[ZX,zy,ZB],[ZX,zy,ZT],[-ZX,zy,ZT]];
     for(let i=0;i<4;i++) line(c[i],c[(i+1)%4],cyan,1.5);
@@ -179,43 +225,69 @@ const BUNDLE = __BUNDLE__;
     line([-ZX,zy,ZB+2*(ZT-ZB)/3],[ZX,zy,ZB+2*(ZT-ZB)/3],'rgba(55,207,224,.2)',1);
   }
 
-  // ---------- state ----------
-  let flight=null, bat=null, anim=null, ballTrail=[];
-  const DUR = 2.3;   // seconds for release->contact (slowed)
+  // ---------- play state ----------
+  let expected=null;      // mean pitch + mean swing (pre-pitch display)
+  let play=null, anim=null, ballTrail=[];
+  const DUR = 2.3;
 
+  function buildPlay(){
+    const p=B.pitchers[+selP.value], h=B.hitters[+selH.value];
+    const base=p.pitches.find(q=>q.type===selT.value)||p.pitches[0];
+    const pt=samplePitch(base);
+    const flight=pitchFlight(pt);
+    const mu=predictSwing(pt,h,p.throws);
+    const m=sampleSwing(mu, h.vscale||1);
+    const y_c=contactDepth(pt,h.stand);
+    const t_c=flight.tAt(y_c);
+    const target=flight.pos(t_c);
+    const inZone=Math.abs(pt.plate[0])<=ZX && pt.plate[1]>=ZB && pt.plate[1]<=ZT;
+    const dzErr=randn()*(inZone?AIM_SD_IN:AIM_SD_OUT);
+    const whiff=Math.abs(dzErr)>HIT_TOL;
+    const batContact=[target[0], y_c, target[2]+dzErr];
+    const bat=reconstructBat(m,batContact,h.stand);
+    const tEnd=whiff?flight.tAt(-2.0):t_c;
+    return {p,h,pt,flight,m,y_c,t_c,target,dzErr,whiff,bat,tEnd,inZone,
+            missIn:Math.abs(dzErr)*12, squared:Math.abs(dzErr)<0.07};
+  }
+
+  // ---------- render loop ----------
   function resize(){ const dpr=Math.min(devicePixelRatio||1,2);
     cv.width=sim.clientWidth*dpr; cv.height=sim.clientHeight*dpr;
     cv.style.width=sim.clientWidth+'px'; cv.style.height=sim.clientHeight+'px';
     ctx.setTransform(dpr,0,0,dpr,0,0); }
-  window.addEventListener('resize',resize);
-  window.addEventListener('load',resize);
+  window.addEventListener('resize',resize); window.addEventListener('load',resize);
   if(window.ResizeObserver){ new ResizeObserver(resize).observe(sim); }
+
+  function drawBatUpTo(bat,k){
+    ctx.lineWidth=3.5; ctx.strokeStyle='rgba(242,145,61,.85)'; ctx.beginPath(); let started=false;
+    for(let i=0;i<=k;i++){const q=project(bat.pts[i]); if(!q){started=false;continue;}
+      if(!started){ctx.moveTo(q.x,q.y);started=true;} else ctx.lineTo(q.x,q.y);} ctx.stroke();
+    ball(bat.pts[k],0.10,'#f2913d',true);
+  }
 
   function render(now){
     ctx.clearRect(0,0,cv.clientWidth,cv.clientHeight);
     drawField();
-    // resting ball at release when idle
-    if(flight && !anim){ ball(flight.pos(flight.tR),0.12,'#eef3f7',true); }
-    if(anim){
+    const P=anim?play:expected;
+    if(P && !anim){ ball(P.flight.pos(P.flight.tR),0.12,'#eef3f7',true); }
+    if(anim && P){
       const el=(now-anim.t0)/1000, prog=Math.min(el/DUR,1);
-      const t = flight.tR + prog*(flight.tP - flight.tR);
-      const bp=flight.pos(t); ballTrail.push(bp); if(ballTrail.length>90) ballTrail.shift();
-      // ball trail
-      ctx.lineWidth=2; ctx.strokeStyle='rgba(55,207,224,.5)'; ctx.beginPath();
-      let started=false; ballTrail.forEach(P=>{const p=project(P); if(!p){started=false;return;}
-        if(!started){ctx.moveTo(p.x,p.y);started=true;} else ctx.lineTo(p.x,p.y);}); ctx.stroke();
-      // bat: active once within its duration before contact
-      const tb = t - flight.tP;               // -flight..0 relative to contact
-      if(tb >= bat.t[0]){
-        let k=0; while(k<bat.t.length-1 && bat.t[k+1] < tb) k++;
-        ctx.lineWidth=3.5; ctx.strokeStyle='rgba(242,145,61,.85)'; ctx.beginPath(); started=false;
-        for(let i=0;i<=k;i++){const p=project(bat.pts[i]); if(!p){started=false;continue;}
-          if(!started){ctx.moveTo(p.x,p.y);started=true;} else ctx.lineTo(p.x,p.y);} ctx.stroke();
-        ball(bat.pts[k],0.10,'#f2913d',true);
+      const t = P.flight.tR + prog*(P.tEnd - P.flight.tR);
+      const done = prog>=1;
+      const bp = P.flight.pos(Math.min(t, P.tEnd));
+      ballTrail.push(bp); if(ballTrail.length>110) ballTrail.shift();
+      ctx.lineWidth=2; ctx.strokeStyle='rgba(55,207,224,.5)'; ctx.beginPath(); let st=false;
+      ballTrail.forEach(q=>{const pr=project(q); if(!pr){st=false;return;}
+        if(!st){ctx.moveTo(pr.x,pr.y);st=true;} else ctx.lineTo(pr.x,pr.y);}); ctx.stroke();
+      const tb = t - P.t_c;
+      if(tb >= P.bat.t[0]){
+        let k=0; while(k<P.bat.t.length-1 && P.bat.t[k+1] < tb) k++;
+        if(!P.whiff) k=Math.min(k,P.bat.contactIdx);
+        drawBatUpTo(P.bat,k);
       }
-      ball(bp,0.12,'#eef3f7',true);
-      if(prog>=1){ ball(flight.contact,0.16,'#fff',true);
-        if(el> DUR+1.1){ anim=null; document.getElementById('go').disabled=false; } }
+      if(!P.whiff && done){ ball(P.target,0.17,'#ffffff',true); }
+      else ball(bp,0.12,'#eef3f7',true);
+      if(done && el>DUR+1.2){ anim=null; go.disabled=false; }
     }
     requestAnimationFrame(render);
   }
@@ -235,26 +307,41 @@ const BUNDLE = __BUNDLE__;
   [selT,selH].forEach(s=>s.addEventListener('change',refresh));
 
   const fmt=(x,d)=>x.toFixed(d===undefined?1:d);
-  function refresh(){
+  function showHUD(pt,m,inZone){
     const p=B.pitchers[+selP.value], h=B.hitters[+selH.value];
-    const pt=p.pitches.find(q=>q.type===selT.value)||p.pitches[0];
-    const m=predictSwing(pt,h,p.throws);
-    flight=pitchFlight(pt); bat=reconstructBat(m,flight.contact,h.stand); ballTrail=[];
-    const inZone = Math.abs(pt.plate[0])<=ZX && pt.plate[1]>=ZB && pt.plate[1]<=ZT;
     document.getElementById('match').innerHTML = '<b>'+p.name+'</b> ('+p.throws+'HP) &nbsp;vs&nbsp; <b>'+h.name.replace(/,.*/,'')+'</b> ('+h.stand+'HH)';
     document.getElementById('velo').textContent=fmt(pt.speed);
-    document.getElementById('ptype').textContent='mph · '+pt.label;
+    document.getElementById('ptype').textContent='mph · '+(pt.label||'');
     const z=document.getElementById('zone'); z.textContent=inZone?'in zone':'out of zone';
     z.className='zone '+(inZone?'in':'out');
     document.getElementById('sw').innerHTML=[
       ['bat speed',fmt(m.bat_speed)+' mph'],['attack angle',fmt(m.attack_angle)+'°'],
       ['swing tilt',fmt(m.swing_path_tilt)+'°'],['attack dir',fmt(m.attack_direction)+'°'],
-      ['swing length',fmt(m.swing_length)+' ft']
+      ['swing length',fmt(m.swing_length)+' ft'],['contact depth',play?fmt(play.y_c)+' ft':'—']
     ].map(([k,v])=>'<div class="cell"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>').join('');
   }
-  go.addEventListener('click',()=>{ if(anim)return; ballTrail=[]; anim={t0:performance.now()}; go.disabled=true; });
+  function setOutcome(txt,cls){const o=document.getElementById('outcome'); o.textContent=txt; o.className='outcome '+cls;}
 
-  // orbit + zoom
+  function refresh(){
+    const p=B.pitchers[+selP.value], h=B.hitters[+selH.value];
+    const pt=p.pitches.find(q=>q.type===selT.value)||p.pitches[0];
+    const flight=pitchFlight(pt), mu=predictSwing(pt,h,p.throws);
+    const y_c0=1.55, t_c=flight.tAt(y_c0);
+    expected={flight, t_c, tEnd:t_c, target:flight.pos(t_c), whiff:false,
+              bat:reconstructBat(mu,flight.pos(t_c).map((v,i)=>i===1?y_c0:v),h.stand)};
+    play=null;
+    showHUD(pt,mu,Math.abs(pt.plate[0])<=ZX && pt.plate[1]>=ZB && pt.plate[1]<=ZT);
+    setOutcome('every pitch + swing is re-sampled — press PITCH','idle');
+  }
+
+  go.addEventListener('click',()=>{ if(anim)return;
+    play=buildPlay(); ballTrail=[];
+    showHUD(Object.assign({label:(B.pitchers[+selP.value].pitches.find(q=>q.type===selT.value)||{}).label},play.pt), play.m, play.inZone);
+    if(play.whiff) setOutcome('WHIFF — '+(play.dzErr<0?'under the ball by ':'over the ball by ')+fmt(play.missIn)+' in','whiff');
+    else if(play.squared) setOutcome('CONTACT — squared up ('+fmt(play.missIn)+' in off center)','hit');
+    else setOutcome('CONTACT — off center by '+fmt(play.missIn)+' in','hit');
+    anim={t0:performance.now()}; go.disabled=true; });
+
   let drag=null;
   cv.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY}; cv.setPointerCapture(e.pointerId);});
   cv.addEventListener('pointermove',e=>{ if(!drag)return; cam.az-=(e.clientX-drag.x)*0.01;
@@ -263,5 +350,6 @@ const BUNDLE = __BUNDLE__;
   cv.addEventListener('wheel',e=>{e.preventDefault(); cam.dist=Math.max(12,Math.min(60,cam.dist+e.deltaY*0.03));},{passive:false});
 
   resize(); refresh(); requestAnimationFrame(render);
+  window.__sim = {buildPlay};   // debug/testing hook
 })();
 </script>
