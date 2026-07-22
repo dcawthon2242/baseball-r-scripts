@@ -1,0 +1,267 @@
+<title>At-Bat Sim: 3D Pitch vs Swing</title>
+<style>
+  :root{
+    --nav0:#0b111c; --nav1:#111d2e; --grass:#20402c; --grass2:#1a3624;
+    --clay:#b5673a; --chalk:#e9e6dc; --ball:#37cfe0; --bat:#f2913d;
+    --ink:#e9edf3; --dim:#8ea0b6; --line:#26374d; --panel:rgba(10,17,28,.78);
+  }
+  *{box-sizing:border-box}
+  .sim{position:relative; width:100%; height:min(82vh,720px); min-height:460px;
+    background:radial-gradient(120% 90% at 50% 8%, #16243a 0%, var(--nav1) 42%, var(--nav0) 100%);
+    border:1px solid var(--line); border-radius:14px; overflow:hidden;
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--ink);
+    user-select:none}
+  .sim canvas{position:absolute; inset:0; width:100%; height:100%; display:block; cursor:grab}
+  .sim canvas:active{cursor:grabbing}
+  .bar{position:absolute; top:0; left:0; right:0; z-index:3; display:flex; flex-wrap:wrap;
+    gap:8px; align-items:center; padding:10px 12px;
+    background:linear-gradient(var(--nav0),rgba(11,17,28,0)); }
+  .bar .grp{display:flex; flex-direction:column; gap:2px}
+  .bar label{font-size:10px; letter-spacing:.14em; text-transform:uppercase; color:var(--dim); padding-left:2px}
+  .bar select{appearance:none; background:#0e1a2b; color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:7px 26px 7px 10px; font-size:13px; max-width:38vw;
+    background-image:linear-gradient(45deg,transparent 50%,var(--dim) 50%),linear-gradient(135deg,var(--dim) 50%,transparent 50%);
+    background-position:calc(100% - 15px) 15px,calc(100% - 10px) 15px; background-size:5px 5px; background-repeat:no-repeat}
+  .bar select:focus-visible{outline:2px solid var(--ball); outline-offset:1px}
+  .bar .spacer{flex:1}
+  .pitch-btn{align-self:flex-end; background:var(--clay); color:#1a0f08; border:none; font-weight:700;
+    letter-spacing:.08em; text-transform:uppercase; font-size:13px; padding:9px 20px; border-radius:8px;
+    cursor:pointer; transition:filter .12s, transform .05s}
+  .pitch-btn:hover{filter:brightness(1.1)} .pitch-btn:active{transform:scale(.97)}
+  .pitch-btn:disabled{opacity:.5; cursor:default}
+  .hud{position:absolute; left:12px; bottom:12px; z-index:3; width:min(320px,72vw);
+    background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px;
+    backdrop-filter:blur(6px); font-family:ui-monospace,"SF Mono","Cascadia Code",Consolas,monospace}
+  .hud .match{font-size:12.5px; color:var(--ink); margin-bottom:8px; line-height:1.5}
+  .hud .match b{color:var(--chalk); font-weight:600}
+  .hud .pitchline{display:flex; align-items:baseline; gap:8px; margin-bottom:10px}
+  .hud .velo{color:var(--ball); font-size:22px; font-weight:600; font-variant-numeric:tabular-nums}
+  .hud .ptype{color:var(--ink); font-size:13px} .hud .zone{margin-left:auto; font-size:10.5px;
+    letter-spacing:.1em; text-transform:uppercase; padding:2px 7px; border-radius:5px}
+  .zone.in{background:rgba(55,207,224,.16); color:var(--ball)} .zone.out{background:rgba(242,145,61,.16); color:var(--bat)}
+  .hud .grid{display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; border-top:1px solid var(--line); padding-top:9px}
+  .hud .cell{display:flex; flex-direction:column}
+  .hud .k{font-size:9.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--dim)}
+  .hud .v{font-size:15px; color:var(--bat); font-variant-numeric:tabular-nums}
+  .hud .swlab{font-size:9.5px; letter-spacing:.12em; text-transform:uppercase; color:var(--bat);
+    margin:9px 0 5px; opacity:.85}
+  .legend{position:absolute; right:12px; bottom:12px; z-index:3; font-size:11px; color:var(--dim);
+    font-family:ui-monospace,monospace; text-align:right; line-height:1.7}
+  .legend .d{display:inline-block; width:9px; height:9px; border-radius:50%; margin-left:7px; vertical-align:middle}
+  .hint{position:absolute; right:12px; top:12px; z-index:3; font-size:11px; color:var(--dim);
+    font-family:ui-monospace,monospace; text-align:right; opacity:.8}
+  @media (max-width:560px){ .bar select{max-width:44vw} .legend{display:none} }
+</style>
+
+<div class="sim" id="sim">
+  <canvas id="cv"></canvas>
+  <div class="bar">
+    <div class="grp"><label for="selP">Pitcher</label>
+      <select id="selP"></select></div>
+    <div class="grp"><label for="selT">Pitch</label>
+      <select id="selT"></select></div>
+    <div class="grp"><label for="selH">Hitter</label>
+      <select id="selH"></select></div>
+    <div class="spacer"></div>
+    <button class="pitch-btn" id="go">Pitch</button>
+  </div>
+  <div class="hud" id="hud">
+    <div class="match" id="match"></div>
+    <div class="pitchline"><span class="velo" id="velo">--</span><span class="ptype" id="ptype">mph</span>
+      <span class="zone out" id="zone">—</span></div>
+    <div class="swlab">emulated swing</div>
+    <div class="grid" id="sw"></div>
+  </div>
+  <div class="hint">drag to orbit · scroll to zoom</div>
+  <div class="legend">Statcast at-bat sim
+    <span class="d" style="background:var(--ball)"></span> pitch<br>
+    hand-tracked swing emulation <span class="d" style="background:var(--bat)"></span> bat</div>
+</div>
+
+<script>
+const BUNDLE = __BUNDLE__;
+(function(){
+  const B = BUNDLE, net = B.net;
+  const YF = 17/12, RUBBER = 60.5, ZX = 0.83, ZB = 1.6, ZT = 3.4;
+  const sim = document.getElementById('sim'), cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+
+  // ---------- math ----------
+  const relu = a => a.map(v => v>0?v:0);
+  const mv = (W,x,b) => W.map((row,i)=>{let s=b[i]; for(let j=0;j<row.length;j++) s+=row[j]*x[j]; return s;});
+  const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+  const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+  const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+  const norm=a=>{const n=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/n,a[1]/n,a[2]/n];};
+
+  // ---------- swing prediction (embedding net) ----------
+  function predictSwing(pitch, hitter, throws){
+    const px_in = hitter.stand==="R" ? -pitch.plate[0] : pitch.plate[0];
+    const pz = pitch.plate[1];
+    const raw = [px_in, (pz-1.6)/1.8, pz, pitch.speed, throws==="R"?1:0];
+    const x = raw.map((v,i)=>(v-B.fmean[i])/B.fsd[i]);
+    const inp = x.concat(B.emb[hitter.idx]);
+    const o = mv(net.w3, relu(mv(net.w2, relu(mv(net.w1,inp,net.b1)), net.b2)), net.b3);
+    const out={}; B.metrics.forEach((m,i)=>out[m]=o[i]*B.tsd[i]+B.tmean[i]);
+    return out;
+  }
+
+  // ---------- bat sweet-spot arc (ported from reconstruction, OBP-calibrated) ----------
+  function reconstructBat(m, contact, stand){
+    const R=B.bat_radius, a=m.attack_angle*Math.PI/180, d=m.attack_direction*Math.PI/180;
+    const tau=Math.max(m.swing_path_tilt*Math.PI/180, Math.abs(a)+1e-6), pull= stand==="R"?-1:1;
+    const vh=[pull*Math.sin(d)*Math.cos(a), Math.cos(d)*Math.cos(a), Math.sin(a)];
+    const sinB=Math.sqrt(Math.max(Math.sin(tau)**2-Math.sin(a)**2,0));
+    const hm=Math.hypot(vh[0],vh[1])||1, h=[vh[0]/hm,vh[1]/hm,0];
+    let perp=[-h[1],h[0],0]; if(Math.sign(perp[0])!==pull) perp=[-perp[0],-perp[1],0];
+    let w=[perp[0]*Math.sqrt(1-sinB*sinB), perp[1]*Math.sqrt(1-sinB*sinB), sinB];
+    const wd=dot(w,vh); w=norm([w[0]-wd*vh[0],w[1]-wd*vh[1],w[2]-wd*vh[2]]);
+    const theta=m.swing_length/R, C=[contact[0]+R*w[0],contact[1]+R*w[1],contact[2]+R*w[2]], N=48;
+    const pts=[], spd=[]; const vc=m.bat_speed*1.466667, seg=m.swing_length/(N-1);
+    for(let i=0;i<N;i++){ const phi=-theta+theta*i/(N-1);
+      pts.push([C[0]+R*(-Math.cos(phi)*w[0]+Math.sin(phi)*vh[0]),
+                C[1]+R*(-Math.cos(phi)*w[1]+Math.sin(phi)*vh[1]),
+                C[2]+R*(-Math.cos(phi)*w[2]+Math.sin(phi)*vh[2])]);
+      spd.push(vc*(0.12+0.88*Math.pow(i/(N-1),1.9))); }
+    const t=[0]; for(let i=1;i<N;i++) t.push(t[i-1]+seg/((spd[i-1]+spd[i])/2));
+    const tmax=t[N-1]; return {pts, t:t.map(v=>v-tmax)};   // t: -dur..0 (0 at contact)
+  }
+
+  // ---------- pitch flight from the 9 params ----------
+  function pitchFlight(p){
+    const [vx0,vy0,vz0]=p.v,[ax,ay,az]=p.a, y0=50;
+    const vyf=-Math.sqrt(vy0*vy0+2*ay*(YF-y0)), tP=(vyf-vy0)/ay;
+    const x50=p.plate[0]-(vx0*tP+0.5*ax*tP*tP), z50=p.plate[1]-(vz0*tP+0.5*az*tP*tP);
+    const yRel=p.rel[1], A=0.5*ay, Bb=vy0, Cc=y0-yRel, disc=Math.sqrt(Bb*Bb-4*A*Cc);
+    const r1=(-Bb+disc)/(2*A), r2=(-Bb-disc)/(2*A), tR=Math.min(r1,r2);
+    const pos=t=>[x50+vx0*t+0.5*ax*t*t, y0+vy0*t+0.5*ay*t*t, z50+vz0*t+0.5*az*t*t];
+    return {pos, tR, tP, contact:[p.plate[0],YF,p.plate[1]]};
+  }
+
+  // ---------- camera / projection (world = Statcast: x right, y toward mound, z up) ----------
+  const cam = {az:-Math.PI/2, el:0.20, dist:30, target:[0,7,2.6]};
+  function project(P){
+    const cp=[cam.target[0]+cam.dist*Math.cos(cam.el)*Math.cos(cam.az),
+              cam.target[1]+cam.dist*Math.cos(cam.el)*Math.sin(cam.az),
+              cam.target[2]+cam.dist*Math.sin(cam.el)];
+    const f=norm(sub(cam.target,cp)), r=norm(cross(f,[0,0,1])), u=cross(r,f);
+    const dP=sub(P,cp), zc=dot(dP,f); if(zc<=0.15) return null;
+    const foc=cv.clientHeight*0.9;
+    return {x:cv.clientWidth/2 + foc*dot(dP,r)/zc, y:cv.clientHeight/2 - foc*dot(dP,u)/zc, z:zc};
+  }
+  function line(a,b,style,wd){const A=project(a),Bp=project(b); if(!A||!Bp)return;
+    ctx.strokeStyle=style; ctx.lineWidth=wd||1; ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(Bp.x,Bp.y); ctx.stroke();}
+  function poly(list,fill){const ps=list.map(project); if(ps.some(p=>!p))return;
+    ctx.fillStyle=fill; ctx.beginPath(); ps.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.closePath(); ctx.fill();}
+  function ball(P,rft,fill,glow){const p=project(P); if(!p)return;
+    const rad=Math.max(1.5, cv.clientHeight*0.9*rft/p.z);
+    if(glow){ctx.shadowColor=fill; ctx.shadowBlur=14;} ctx.fillStyle=fill;
+    ctx.beginPath(); ctx.arc(p.x,p.y,rad,0,7); ctx.fill(); ctx.shadowBlur=0;}
+
+  // ---------- static scene ----------
+  function drawField(){
+    poly([[-46,-6,0],[46,-6,0],[46,80,0],[-46,80,0]], '#16301f');           // grass
+    for(let gy=0;gy<=70;gy+=10) line([-46,gy,0],[46,gy,0],'rgba(255,255,255,.03)',1);
+    // infield dirt
+    poly([[0,0,0],[17,17,0],[0,34,0],[-17,17,0]], '#6b3f24');
+    poly([[-9,55,.001],[9,55,.001],[9,66,.001],[-9,66,.001]], '#6b3f24');
+    // foul lines
+    line([0,0,0],[38,42,0],'rgba(233,230,220,.5)',2); line([0,0,0],[-38,42,0],'rgba(233,230,220,.5)',2);
+    // home plate
+    poly([[-.71,0,.02],[.71,0,.02],[.71,.71,.02],[0,1.42,.02],[-.71,.71,.02]], '#dcd8cc');
+    // rubber
+    poly([[-1,RUBBER-.1,.03],[1,RUBBER-.1,.03],[1,RUBBER+.1,.03],[-1,RUBBER+.1,.03]], '#dcd8cc');
+    // strike zone (front plane box outline)
+    const zy=YF, cyan='rgba(55,207,224,.55)';
+    const c=[[-ZX,zy,ZB],[ZX,zy,ZB],[ZX,zy,ZT],[-ZX,zy,ZT]];
+    for(let i=0;i<4;i++) line(c[i],c[(i+1)%4],cyan,1.5);
+    line([-ZX/3,zy,ZB],[-ZX/3,zy,ZT],'rgba(55,207,224,.2)',1); line([ZX/3,zy,ZB],[ZX/3,zy,ZT],'rgba(55,207,224,.2)',1);
+    line([-ZX,zy,ZB+(ZT-ZB)/3],[ZX,zy,ZB+(ZT-ZB)/3],'rgba(55,207,224,.2)',1);
+    line([-ZX,zy,ZB+2*(ZT-ZB)/3],[ZX,zy,ZB+2*(ZT-ZB)/3],'rgba(55,207,224,.2)',1);
+  }
+
+  // ---------- state ----------
+  let flight=null, bat=null, anim=null, ballTrail=[];
+  const DUR = 2.3;   // seconds for release->contact (slowed)
+
+  function resize(){ const dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=sim.clientWidth*dpr; cv.height=sim.clientHeight*dpr;
+    cv.style.width=sim.clientWidth+'px'; cv.style.height=sim.clientHeight+'px';
+    ctx.setTransform(dpr,0,0,dpr,0,0); }
+  window.addEventListener('resize',resize);
+  window.addEventListener('load',resize);
+  if(window.ResizeObserver){ new ResizeObserver(resize).observe(sim); }
+
+  function render(now){
+    ctx.clearRect(0,0,cv.clientWidth,cv.clientHeight);
+    drawField();
+    // resting ball at release when idle
+    if(flight && !anim){ ball(flight.pos(flight.tR),0.12,'#eef3f7',true); }
+    if(anim){
+      const el=(now-anim.t0)/1000, prog=Math.min(el/DUR,1);
+      const t = flight.tR + prog*(flight.tP - flight.tR);
+      const bp=flight.pos(t); ballTrail.push(bp); if(ballTrail.length>90) ballTrail.shift();
+      // ball trail
+      ctx.lineWidth=2; ctx.strokeStyle='rgba(55,207,224,.5)'; ctx.beginPath();
+      let started=false; ballTrail.forEach(P=>{const p=project(P); if(!p){started=false;return;}
+        if(!started){ctx.moveTo(p.x,p.y);started=true;} else ctx.lineTo(p.x,p.y);}); ctx.stroke();
+      // bat: active once within its duration before contact
+      const tb = t - flight.tP;               // -flight..0 relative to contact
+      if(tb >= bat.t[0]){
+        let k=0; while(k<bat.t.length-1 && bat.t[k+1] < tb) k++;
+        ctx.lineWidth=3.5; ctx.strokeStyle='rgba(242,145,61,.85)'; ctx.beginPath(); started=false;
+        for(let i=0;i<=k;i++){const p=project(bat.pts[i]); if(!p){started=false;continue;}
+          if(!started){ctx.moveTo(p.x,p.y);started=true;} else ctx.lineTo(p.x,p.y);} ctx.stroke();
+        ball(bat.pts[k],0.10,'#f2913d',true);
+      }
+      ball(bp,0.12,'#eef3f7',true);
+      if(prog>=1){ ball(flight.contact,0.16,'#fff',true);
+        if(el> DUR+1.1){ anim=null; document.getElementById('go').disabled=false; } }
+    }
+    requestAnimationFrame(render);
+  }
+
+  // ---------- UI ----------
+  const selP=document.getElementById('selP'), selT=document.getElementById('selT'),
+        selH=document.getElementById('selH'), go=document.getElementById('go');
+  B.pitchers.forEach((p,i)=>{const o=document.createElement('option'); o.value=i; o.textContent=p.name+' ('+p.throws+')'; selP.appendChild(o);});
+  B.hitters.forEach((h,i)=>{const o=document.createElement('option'); o.value=i; o.textContent=h.name+' ('+h.stand+')'; selH.appendChild(o);});
+  function fillPitches(){ selT.innerHTML=''; const p=B.pitchers[+selP.value];
+    p.pitches.slice().sort((a,b)=>b.speed-a.speed).forEach(pt=>{const o=document.createElement('option');
+      o.value=pt.type; o.textContent=pt.label+'  ·  '+pt.speed+' mph'; selT.appendChild(o);}); }
+  const dP=Math.max(0,B.pitchers.findIndex(p=>/Skenes|Skubal|Wheeler|Sale/.test(p.name)));
+  selP.value=dP; fillPitches();
+  const dH=Math.max(0,B.hitters.findIndex(h=>/Judge, Aaron/.test(h.name))); selH.value=dH;
+  selP.addEventListener('change',()=>{fillPitches(); refresh();});
+  [selT,selH].forEach(s=>s.addEventListener('change',refresh));
+
+  const fmt=(x,d)=>x.toFixed(d===undefined?1:d);
+  function refresh(){
+    const p=B.pitchers[+selP.value], h=B.hitters[+selH.value];
+    const pt=p.pitches.find(q=>q.type===selT.value)||p.pitches[0];
+    const m=predictSwing(pt,h,p.throws);
+    flight=pitchFlight(pt); bat=reconstructBat(m,flight.contact,h.stand); ballTrail=[];
+    const inZone = Math.abs(pt.plate[0])<=ZX && pt.plate[1]>=ZB && pt.plate[1]<=ZT;
+    document.getElementById('match').innerHTML = '<b>'+p.name+'</b> ('+p.throws+'HP) &nbsp;vs&nbsp; <b>'+h.name.replace(/,.*/,'')+'</b> ('+h.stand+'HH)';
+    document.getElementById('velo').textContent=fmt(pt.speed);
+    document.getElementById('ptype').textContent='mph · '+pt.label;
+    const z=document.getElementById('zone'); z.textContent=inZone?'in zone':'out of zone';
+    z.className='zone '+(inZone?'in':'out');
+    document.getElementById('sw').innerHTML=[
+      ['bat speed',fmt(m.bat_speed)+' mph'],['attack angle',fmt(m.attack_angle)+'°'],
+      ['swing tilt',fmt(m.swing_path_tilt)+'°'],['attack dir',fmt(m.attack_direction)+'°'],
+      ['swing length',fmt(m.swing_length)+' ft']
+    ].map(([k,v])=>'<div class="cell"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>').join('');
+  }
+  go.addEventListener('click',()=>{ if(anim)return; ballTrail=[]; anim={t0:performance.now()}; go.disabled=true; });
+
+  // orbit + zoom
+  let drag=null;
+  cv.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY}; cv.setPointerCapture(e.pointerId);});
+  cv.addEventListener('pointermove',e=>{ if(!drag)return; cam.az-=(e.clientX-drag.x)*0.01;
+    cam.el=Math.max(0.05,Math.min(1.35,cam.el+(e.clientY-drag.y)*0.006)); drag={x:e.clientX,y:e.clientY};});
+  cv.addEventListener('pointerup',()=>drag=null); cv.addEventListener('pointercancel',()=>drag=null);
+  cv.addEventListener('wheel',e=>{e.preventDefault(); cam.dist=Math.max(12,Math.min(60,cam.dist+e.deltaY*0.03));},{passive:false});
+
+  resize(); refresh(); requestAnimationFrame(render);
+})();
+</script>
