@@ -41,6 +41,7 @@
   .zone.in{background:rgba(55,207,224,.16); color:var(--ball)} .zone.out{background:rgba(242,145,61,.16); color:var(--bat)}
   .outcome{font-size:12px; min-height:17px; margin-bottom:8px; letter-spacing:.04em}
   .outcome.whiff{color:#e2564d} .outcome.hit{color:#65d98d} .outcome.idle{color:var(--dim)}
+  .outcome.take{color:var(--ball)}
   .hud .grid{display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; border-top:1px solid var(--line); padding-top:9px}
   .hud .cell{display:flex; flex-direction:column}
   .hud .k{font-size:9.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--dim)}
@@ -64,6 +65,11 @@
       <select id="selT"></select></div>
     <div class="grp"><label for="selH">Hitter</label>
       <select id="selH"></select></div>
+    <div class="grp"><label for="selC">Count</label>
+      <select id="selC"><option>0-0</option><option>1-0</option><option>0-1</option>
+        <option>2-0</option><option>1-1</option><option>0-2</option><option>3-0</option>
+        <option>2-1</option><option>1-2</option><option>3-1</option><option>2-2</option>
+        <option>3-2</option></select></div>
     <div class="spacer"></div>
     <button class="pitch-btn" id="go">Pitch</button>
   </div>
@@ -126,17 +132,47 @@ const BUNDLE = __BUNDLE__;
     return m;
   }
 
+  // ---------- swing/take decision net (own batter embedding) ----------
+  function decisionProb(pt, hitter, throws, balls, strikes){
+    const D=B.dec;
+    const px_in = hitter.stand==="R" ? -pt.plate[0] : pt.plate[0];
+    const raw=[px_in,(pt.plate[1]-1.6)/1.8,pt.plate[0],pt.plate[1],pt.speed,
+               pt.pfx[0],pt.pfx[1],balls,strikes,throws==="R"?1:0];
+    const x=raw.map((v,i)=>(v-D.fmean[i])/D.fsd[i]);
+    const e=(hitter.didx>=0)?D.emb[hitter.didx]:D.meanEmb;
+    const b3=Array.isArray(D.b3)?D.b3:[D.b3];   // jsonlite unboxes length-1 vectors
+    const o=mv(D.w3, relu(mv(D.w2, relu(mv(D.w1, x.concat(e), D.b1)), D.b2)), b3)[0];
+    return 1/(1+Math.exp(-o));
+  }
+
   // ---------- pitch sampling & flight ----------
+  // joint draw of (plate_x, plate_z, speed, pfx_x, pfx_z): the pitcher's own
+  // per-pitch-type scatter magnitudes x the league correlation structure for
+  // that pitch type, so extra break arrives WITH the location shift it causes.
   function samplePitch(pt){
-    const f0=pitchFlight(pt), span=f0.tP-f0.tR;
-    const sd=pt.sd||[0.28,0.28,0.9];
-    const dx=randn()*sd[0], dz=randn()*sd[1], ds=randn()*Math.min(sd[2],1.6);
-    const s=(pt.speed+ds)/pt.speed;
-    return Object.assign({}, pt, {
-      speed:+(pt.speed+ds).toFixed(1),
-      plate:[pt.plate[0]+dx, pt.plate[1]+dz],
-      v:[(pt.v[0]+dx/span)*s, pt.v[1]*s, (pt.v[2]+dz/span)*s]
+    const f0=pitchFlight(pt), tP=f0.tP;
+    const sds=[(pt.sd&&pt.sd[0])||0.28,(pt.sd&&pt.sd[1])||0.28,
+               Math.min((pt.sd&&pt.sd[2])||0.9,1.8),(pt.sd&&pt.sd[3])||0.12,(pt.sd&&pt.sd[4])||0.12];
+    const R=B.cors&&B.cors[pt.type];
+    const z=[randn(),randn(),randn(),randn(),randn()]; let d;
+    if(R){ const C=R.map((row,i)=>row.map((v,j)=>v*sds[i]*sds[j]));
+           const L=chol(C); d=L.map(r=>r.reduce((s,v,j)=>s+v*z[j],0)); }
+    else d=z.map((v,i)=>v*sds[i]);
+    const [dpx,dpz,dspd,dfx,dfz]=d;
+    const s=(pt.speed+dspd)/pt.speed;
+    const dax=2*dfx/(tP*tP), daz=2*dfz/(tP*tP);   // pfx (ft) -> accel over flight
+    const p1=Object.assign({}, pt, {
+      speed:+(pt.speed+dspd).toFixed(1),
+      plate:[pt.plate[0]+dpx, pt.plate[1]+dpz],
+      pfx:[pt.pfx[0]+dfx, pt.pfx[1]+dfz],
+      v:[pt.v[0]*s, pt.v[1]*s, pt.v[2]*s],
+      a:[pt.a[0]+dax, pt.a[1], pt.a[2]+daz]
     });
+    // hold the release point at the pitcher's hand: nudge v so the sampled
+    // path (anchored at its sampled plate location) still leaves from r0
+    const r0=f0.pos(f0.tR), f1=pitchFlight(p1), r1=f1.pos(f1.tR), dt=f1.tR-f1.tP;
+    p1.v=[p1.v[0]+(r0[0]-r1[0])/dt, p1.v[1], p1.v[2]+(r0[2]-r1[2])/dt];
+    return p1;
   }
   function pitchFlight(p){
     const [vx0,vy0,vz0]=p.v,[ax,ay,az]=p.a, y0=50;
@@ -230,8 +266,9 @@ const BUNDLE = __BUNDLE__;
   let play=null, anim=null, ballTrail=[];
   const DUR = 2.3;
 
+  function getCount(){ const cs=selC.value.split('-'); return {balls:+cs[0], strikes:+cs[1]}; }
   function buildPlay(){
-    const p=B.pitchers[+selP.value], h=B.hitters[+selH.value];
+    const p=B.pitchers[+selP.value], h=B.hitters[+selH.value], ct=getCount();
     const base=p.pitches.find(q=>q.type===selT.value)||p.pitches[0];
     const pt=samplePitch(base);
     const flight=pitchFlight(pt);
@@ -241,12 +278,14 @@ const BUNDLE = __BUNDLE__;
     const t_c=flight.tAt(y_c);
     const target=flight.pos(t_c);
     const inZone=Math.abs(pt.plate[0])<=ZX && pt.plate[1]>=ZB && pt.plate[1]<=ZT;
+    const pSwing=decisionProb(pt,h,p.throws,ct.balls,ct.strikes);
+    const take=Math.random()>=pSwing;
     const dzErr=randn()*(inZone?AIM_SD_IN:AIM_SD_OUT);
-    const whiff=Math.abs(dzErr)>HIT_TOL;
+    const whiff=!take && Math.abs(dzErr)>HIT_TOL;
     const batContact=[target[0], y_c, target[2]+dzErr];
-    const bat=reconstructBat(m,batContact,h.stand);
-    const tEnd=whiff?flight.tAt(-2.0):t_c;
-    return {p,h,pt,flight,m,y_c,t_c,target,dzErr,whiff,bat,tEnd,inZone,
+    const bat=take?null:reconstructBat(m,batContact,h.stand);
+    const tEnd=(take||whiff)?flight.tAt(-2.0):t_c;
+    return {p,h,pt,flight,m,y_c,t_c,target,dzErr,whiff,take,pSwing,bat,tEnd,inZone,
             missIn:Math.abs(dzErr)*12, squared:Math.abs(dzErr)<0.07};
   }
 
@@ -280,12 +319,12 @@ const BUNDLE = __BUNDLE__;
       ballTrail.forEach(q=>{const pr=project(q); if(!pr){st=false;return;}
         if(!st){ctx.moveTo(pr.x,pr.y);st=true;} else ctx.lineTo(pr.x,pr.y);}); ctx.stroke();
       const tb = t - P.t_c;
-      if(tb >= P.bat.t[0]){
+      if(P.bat && tb >= P.bat.t[0]){
         let k=0; while(k<P.bat.t.length-1 && P.bat.t[k+1] < tb) k++;
         if(!P.whiff) k=Math.min(k,P.bat.contactIdx);
         drawBatUpTo(P.bat,k);
       }
-      if(!P.whiff && done){ ball(P.target,0.17,'#ffffff',true); }
+      if(!P.take && !P.whiff && done){ ball(P.target,0.17,'#ffffff',true); }
       else ball(bp,0.12,'#eef3f7',true);
       if(done && el>DUR+1.2){ anim=null; go.disabled=false; }
     }
@@ -294,7 +333,8 @@ const BUNDLE = __BUNDLE__;
 
   // ---------- UI ----------
   const selP=document.getElementById('selP'), selT=document.getElementById('selT'),
-        selH=document.getElementById('selH'), go=document.getElementById('go');
+        selH=document.getElementById('selH'), selC=document.getElementById('selC'),
+        go=document.getElementById('go');
   B.pitchers.forEach((p,i)=>{const o=document.createElement('option'); o.value=i; o.textContent=p.name+' ('+p.throws+')'; selP.appendChild(o);});
   B.hitters.forEach((h,i)=>{const o=document.createElement('option'); o.value=i; o.textContent=h.name+' ('+h.stand+')'; selH.appendChild(o);});
   function fillPitches(){ selT.innerHTML=''; const p=B.pitchers[+selP.value];
@@ -304,10 +344,10 @@ const BUNDLE = __BUNDLE__;
   selP.value=dP; fillPitches();
   const dH=Math.max(0,B.hitters.findIndex(h=>/Judge, Aaron/.test(h.name))); selH.value=dH;
   selP.addEventListener('change',()=>{fillPitches(); refresh();});
-  [selT,selH].forEach(s=>s.addEventListener('change',refresh));
+  [selT,selH,selC].forEach(s=>s.addEventListener('change',refresh));
 
   const fmt=(x,d)=>x.toFixed(d===undefined?1:d);
-  function showHUD(pt,m,inZone){
+  function showHUD(pt,m,inZone,pSwing){
     const p=B.pitchers[+selP.value], h=B.hitters[+selH.value];
     document.getElementById('match').innerHTML = '<b>'+p.name+'</b> ('+p.throws+'HP) &nbsp;vs&nbsp; <b>'+h.name.replace(/,.*/,'')+'</b> ('+h.stand+'HH)';
     document.getElementById('velo').textContent=fmt(pt.speed);
@@ -317,7 +357,8 @@ const BUNDLE = __BUNDLE__;
     document.getElementById('sw').innerHTML=[
       ['bat speed',fmt(m.bat_speed)+' mph'],['attack angle',fmt(m.attack_angle)+'°'],
       ['swing tilt',fmt(m.swing_path_tilt)+'°'],['attack dir',fmt(m.attack_direction)+'°'],
-      ['swing length',fmt(m.swing_length)+' ft'],['contact depth',play?fmt(play.y_c)+' ft':'—']
+      ['swing length',fmt(m.swing_length)+' ft'],['contact depth',play?fmt(play.y_c)+' ft':'—'],
+      ['p(swing) @ '+selC.value, fmt(pSwing*100,0)+'%']
     ].map(([k,v])=>'<div class="cell"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>').join('');
   }
   function setOutcome(txt,cls){const o=document.getElementById('outcome'); o.textContent=txt; o.className='outcome '+cls;}
@@ -330,14 +371,17 @@ const BUNDLE = __BUNDLE__;
     expected={flight, t_c, tEnd:t_c, target:flight.pos(t_c), whiff:false,
               bat:reconstructBat(mu,flight.pos(t_c).map((v,i)=>i===1?y_c0:v),h.stand)};
     play=null;
-    showHUD(pt,mu,Math.abs(pt.plate[0])<=ZX && pt.plate[1]>=ZB && pt.plate[1]<=ZT);
+    const ct=getCount();
+    showHUD(pt,mu,Math.abs(pt.plate[0])<=ZX && pt.plate[1]>=ZB && pt.plate[1]<=ZT,
+            decisionProb(pt,h,p.throws,ct.balls,ct.strikes));
     setOutcome('every pitch + swing is re-sampled — press PITCH','idle');
   }
 
   go.addEventListener('click',()=>{ if(anim)return;
     play=buildPlay(); ballTrail=[];
-    showHUD(Object.assign({label:(B.pitchers[+selP.value].pitches.find(q=>q.type===selT.value)||{}).label},play.pt), play.m, play.inZone);
-    if(play.whiff) setOutcome('WHIFF — '+(play.dzErr<0?'under the ball by ':'over the ball by ')+fmt(play.missIn)+' in','whiff');
+    showHUD(Object.assign({label:(B.pitchers[+selP.value].pitches.find(q=>q.type===selT.value)||{}).label},play.pt), play.m, play.inZone, play.pSwing);
+    if(play.take) setOutcome('TAKE — '+(play.inZone?'called strike':'ball'),'take');
+    else if(play.whiff) setOutcome('WHIFF — '+(play.dzErr<0?'under the ball by ':'over the ball by ')+fmt(play.missIn)+' in','whiff');
     else if(play.squared) setOutcome('CONTACT — squared up ('+fmt(play.missIn)+' in off center)','hit');
     else setOutcome('CONTACT — off center by '+fmt(play.missIn)+' in','hit');
     anim={t0:performance.now()}; go.disabled=true; });

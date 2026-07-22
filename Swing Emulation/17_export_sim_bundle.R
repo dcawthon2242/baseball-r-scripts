@@ -22,10 +22,25 @@ traj <- raw |>
   summarise(n = n(), throws = names(which.max(table(p_throws))),
             px_sd = sd(plate_x, na.rm = TRUE), pz_sd = sd(plate_z, na.rm = TRUE),
             spd_sd = sd(release_speed, na.rm = TRUE),
+            pfxx_sd = sd(pfx_x, na.rm = TRUE), pfxz_sd = sd(pfx_z, na.rm = TRUE),
             across(c(release_pos_x, release_pos_y, release_pos_z, vx0, vy0, vz0,
-                     ax, ay, az, release_speed, plate_x, plate_z), ~ mean(.x, na.rm = TRUE)),
+                     ax, ay, az, release_speed, plate_x, plate_z, pfx_x, pfx_z),
+                   ~ mean(.x, na.rm = TRUE)),
             .groups = "drop") |>
   filter(n >= 25)
+
+# league-wide correlation structure of (plate_x, plate_z, speed, pfx_x, pfx_z)
+# per pitch type -- lets the sim sample movement/speed/location JOINTLY (extra
+# break arrives with the location shift it causes) while each pitcher keeps his
+# own scatter magnitudes
+cor_dat <- raw |>
+  filter(pitch_type %in% names(PT_NAMES)) |>
+  select(pitch_type, plate_x, plate_z, release_speed, pfx_x, pfx_z) |>
+  drop_na() |>
+  group_by(pitch_type)
+cors_json <- set_names(
+  group_map(cor_dat, ~ round(unname(cor(as.matrix(.x))), 3)),
+  group_keys(cor_dat)$pitch_type)
 
 # keep pitchers with >= 200 total tracked pitches (regulars)
 keep_pit <- traj |> group_by(pitcher) |> summarise(tot = sum(n)) |> filter(tot >= 200) |> pull(pitcher)
@@ -51,7 +66,8 @@ pitchers_json <- traj |>
     v = pmap(list(vx0, vy0, vz0), ~ round(c(...), 3)),
     a = pmap(list(ax, ay, az), ~ round(c(...), 3)),
     speed = round(release_speed, 1), plate = pmap(list(plate_x, plate_z), ~ round(c(...), 3)),
-    sd = pmap(list(px_sd, pz_sd, spd_sd), ~ round(c(...), 3))
+    pfx = pmap(list(pfx_x, pfx_z), ~ round(c(...), 3)),
+    sd = pmap(list(px_sd, pz_sd, spd_sd, pfxx_sd, pfxz_sd), ~ round(c(...), 3))
   )), .groups = "drop") |>
   arrange(name)
 
@@ -66,10 +82,26 @@ net <- torch_load(file.path(model_dir, "player_embed_net.pt"))
 sd <- net$state_dict(); W <- function(k) round(as.array(sd[[k]]$cpu()), 5)
 
 variety <- readRDS(file.path(model_dir, "swing_variety.rds"))
+
+# swing/take decision net (script 15) -- has its OWN batter key; map onto the
+# main hitter list by MLBAM batter id, -1 where the hitter lacks a decision
+# embedding (JS falls back to the league-mean vector)
+dmeta <- readRDS(file.path(model_dir, "swing_decision_meta.rds"))
+decnet_mod <- nn_module("decnet",
+  initialize = function(nb, nf, ed) {
+    self$emb <- nn_embedding(nb, ed); self$fc1 <- nn_linear(nf + ed, 64)
+    self$fc2 <- nn_linear(64, 32); self$drop <- nn_dropout(0.15); self$out <- nn_linear(32, 1) },
+  forward = function(x, b) x)
+dnet <- torch_load(file.path(model_dir, "swing_decision_net.pt"))
+dsd <- dnet$state_dict(); DW <- function(k) round(as.array(dsd[[k]]$cpu()), 5)
+demb <- as.array(dsd[["emb.weight"]]$cpu())
+
 hitters_json <- meta$batter_key |>
   left_join(variety$hit_scale, by = "b_idx") |>
+  left_join(transmute(dmeta$bkey, batter, didx = b_idx - 1), by = "batter") |>
   transmute(name = player_name, stand, idx = b_idx - 1,      # 0-based for JS
-            vscale = round(coalesce(scale, 1), 3)) |>
+            vscale = round(coalesce(scale, 1), 3),
+            didx = coalesce(didx, -1)) |>
   arrange(name)
 
 # contact DEPTH model: how far in front of the plate the barrel meets the ball,
@@ -99,7 +131,12 @@ bundle <- list(
   tmean = round(meta$tmean, 5), tsd = round(meta$tsd, 5),
   bat_radius = 2.57,
   sigma = round(unname(variety$Sigma), 4),   # 5x5 swing-to-swing covariance
-  depth = depth_json
+  depth = depth_json,
+  cors = cors_json,                          # per-pitch-type 5x5 correlations
+  dec = list(w1 = DW("fc1.weight"), b1 = DW("fc1.bias"), w2 = DW("fc2.weight"),
+             b2 = DW("fc2.bias"), w3 = DW("out.weight"), b3 = DW("out.bias"),
+             emb = round(demb, 5), meanEmb = round(colMeans(demb), 5),
+             fmean = round(unname(dmeta$fmean), 5), fsd = round(unname(dmeta$fsd), 5))
 )
 write_json(bundle, file.path(web_dir, "sim_bundle.json"), auto_unbox = TRUE, digits = 5)
 cat("wrote sim_bundle.json (", round(file.size(file.path(web_dir, "sim_bundle.json"))/1024), "KB), ",
