@@ -21,7 +21,10 @@ model_dir <- file.path("Swing Emulation", "models")
 out_dir   <- file.path("Swing Emulation", "output")
 dir.create(out_dir, showWarnings = FALSE)
 
-BAT_ARC_RADIUS <- 2.75  # ft, hands-to-sweet-spot pivot radius (approximation)
+BAT_ARC_RADIUS <- 2.57  # ft, arc radius at contact; calibrated to OBP tracked
+                        # swings (script 16, median 2.57, IQR 2.36-2.77). The
+                        # OBP swings are also ~perfectly planar (out/in-plane
+                        # residual 0.005), validating the planar-arc model.
 
 # Bat sweet-spot path ending at `contact` (c(x, y, z) ft).
 # attack_angle (deg up from horizontal), attack_direction (deg toward pull),
@@ -59,10 +62,14 @@ reconstruct_bat_path <- function(bat_speed, swing_length, attack_angle,
   pts <- map(phi, \(p) center + BAT_ARC_RADIUS * (-cos(p) * w + sin(p) * v_hat))
   path <- do.call(rbind, pts) |> as_tibble(.name_repair = ~ c("x", "y", "z"))
 
-  # timestamps: speed ramps linearly from 30% to 100% of contact speed
+  # timestamps: speed ramps CONVEXLY (slow early, whip late) toward contact.
+  # Calibrated to OBP tracked swings (script 16): the real profile is far from
+  # linear -- the bat is ~10-15% of contact speed most of the way, then
+  # accelerates hard in the final ~60 ms. Approximated here as a power law.
   v_c   <- bat_speed * 1.466667                     # mph -> ft/s
   seg   <- swing_length / (n_points - 1)
-  speed <- seq(0.3 * v_c, v_c, length.out = n_points)
+  frac  <- seq(0, 1, length.out = n_points)
+  speed <- v_c * (0.12 + 0.88 * frac^1.9)
   path$t <- c(0, cumsum(seg / ((head(speed, -1) + tail(speed, -1)) / 2)))
   path$t <- path$t - max(path$t)                    # t = 0 at contact
   path
