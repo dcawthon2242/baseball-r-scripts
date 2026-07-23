@@ -96,6 +96,12 @@ dnet <- torch_load(file.path(model_dir, "swing_decision_net.pt"))
 dsd <- dnet$state_dict(); DW <- function(k) round(as.array(dsd[[k]]$cpu()), 5)
 demb <- as.array(dsd[["emb.weight"]]$cpu())
 
+# contact net (script 18): P(whiff) + vertical miss bias + predicted miss
+# distance; shares the swing net's b_idx space so JS reuses hitter.idx
+cmeta <- readRDS(file.path(model_dir, "contact_meta.rds"))
+cnet <- torch_load(file.path(model_dir, "contact_net.pt"))
+csd <- cnet$state_dict(); CW <- function(k) round(as.array(csd[[k]]$cpu()), 5)
+
 hitters_json <- meta$batter_key |>
   left_join(variety$hit_scale, by = "b_idx") |>
   left_join(transmute(dmeta$bkey, batter, didx = b_idx - 1), by = "batter") |>
@@ -136,7 +142,13 @@ bundle <- list(
   dec = list(w1 = DW("fc1.weight"), b1 = DW("fc1.bias"), w2 = DW("fc2.weight"),
              b2 = DW("fc2.bias"), w3 = DW("out.weight"), b3 = DW("out.bias"),
              emb = round(demb, 5), meanEmb = round(colMeans(demb), 5),
-             fmean = round(unname(dmeta$fmean), 5), fsd = round(unname(dmeta$fsd), 5))
+             fmean = round(unname(dmeta$fmean), 5), fsd = round(unname(dmeta$fsd), 5)),
+  con = list(w1 = CW("fc1.weight"), b1 = CW("fc1.bias"), w2 = CW("fc2.weight"),
+             b2 = CW("fc2.bias"), w3 = CW("out.weight"), b3 = CW("out.bias"),
+             emb = round(as.array(csd[["emb.weight"]]$cpu()), 5),
+             fmean = round(unname(cmeta$fmean), 5), fsd = round(unname(cmeta$fsd), 5),
+             bias_m = round(cmeta$bias_m, 4), bias_s = round(cmeta$bias_s, 4),
+             miss_m = round(cmeta$miss_m, 4), miss_s = round(cmeta$miss_s, 4))
 )
 write_json(bundle, file.path(web_dir, "sim_bundle.json"), auto_unbox = TRUE, digits = 5)
 cat("wrote sim_bundle.json (", round(file.size(file.path(web_dir, "sim_bundle.json"))/1024), "KB), ",

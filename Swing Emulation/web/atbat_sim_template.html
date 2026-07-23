@@ -92,8 +92,11 @@ const BUNDLE = __BUNDLE__;
 (function(){
   const B = BUNDLE, net = B.net;
   const YF = 17/12, RUBBER = 60.5, ZX = 0.83, ZB = 1.6, ZT = 3.4;
-  const BALL_R = 0.121, BARREL_R = 0.11, HIT_TOL = BALL_R + BARREL_R; // ft
-  const AIM_SD_IN = 0.185, AIM_SD_OUT = 0.28;                         // vertical barrel error (ft)
+  const BALL_R = 1.45/12;                       // regulation ball radius (ft)
+  const BAT_LEN = 34/12, SWEET_FROM_KNOB = 28/12, KNOB_S = 0;
+  const BARREL_R_FT = 1.30/12;                  // max barrel radius (2.61" dia)
+  const TOL = BARREL_R_FT + BALL_R;             // barrel-center tolerance for sigma calibration
+  const BIAS_S = 0.0033;                        // ft of bat-under-ball per degree of (LA - attack)
   const sim = document.getElementById('sim'), cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 
   // ---------- math ----------
@@ -143,6 +146,67 @@ const BUNDLE = __BUNDLE__;
     const b3=Array.isArray(D.b3)?D.b3:[D.b3];   // jsonlite unboxes length-1 vectors
     const o=mv(D.w3, relu(mv(D.w2, relu(mv(D.w1, x.concat(e), D.b1)), D.b2)), b3)[0];
     return 1/(1+Math.exp(-o));
+  }
+
+  // ---------- contact net: P(whiff), vertical miss bias, miss distance ----------
+  function contactPredict(pt, hitter, throws, balls, strikes){
+    const C=B.con;
+    const px_in = hitter.stand==="R" ? -pt.plate[0] : pt.plate[0];
+    const raw=[px_in,(pt.plate[1]-1.6)/1.8,pt.plate[1],pt.speed,pt.pfx[0],pt.pfx[1],
+               balls,strikes,throws==="R"?1:0,hitter.stand==="R"?1:0];
+    const x=raw.map((v,i)=>(v-C.fmean[i])/C.fsd[i]);
+    const o=mv(C.w3, relu(mv(C.w2, relu(mv(C.w1, x.concat(C.emb[hitter.idx]), C.b1)), C.b2)), C.b3);
+    return {pWhiff:1/(1+Math.exp(-o[0])),
+            biasDeg:o[1]*C.bias_s+C.bias_m,
+            missIn:Math.max(0.2,o[2]*C.miss_s+C.miss_m)};
+  }
+  // solve sigma so the aim-error distribution reproduces the model's P(whiff)
+  // against the barrel tolerance:  P(|N(mu,sigma)| > TOL) = pWhiff
+  function solveSigma(mu, p){
+    p=Math.max(0.02,Math.min(0.95,p)); mu=Math.max(-0.8*TOL,Math.min(0.8*TOL,mu));
+    const F=x=>0.5*(1+erf(x/Math.SQRT2));
+    const pw=s=>1-(F((TOL-mu)/s)-F((-TOL-mu)/s));
+    let lo=0.02, hi=0.8;
+    for(let i=0;i<40;i++){const mid=(lo+hi)/2; if(pw(mid)<p) lo=mid; else hi=mid;}
+    return (lo+hi)/2;
+  }
+  function erf(x){const s=x<0?-1:1; x=Math.abs(x);
+    const t=1/(1+0.3275911*x);
+    const y=1-((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-x*x);
+    return s*y;}
+
+  // ---------- physical bat: 34 in, standard taper ----------
+  // axis is radial from the swing pivot C through the sweet spot; the sweet
+  // spot sits 28 in from the knob (6 in from the head)
+  function batRadiusAt(u){            // u = ft from knob
+    if(u<0.83) return 0.039;          // handle (0.94" dia)
+    if(u<1.75) return 0.039+(0.108-0.039)*(u-0.83)/0.92;  // taper
+    return 0.108;                     // barrel (2.61" dia)
+  }
+  function batStateAt(bat, tb){
+    const T=bat.t, P=bat.pts, n=T.length;
+    const tt=Math.max(T[0], Math.min(tb, T[n-1]));
+    let k=0; while(k<n-1 && T[k+1]<tt) k++;
+    const f=(tt-T[k])/((T[k+1]-T[k])||1e-9);
+    return [0,1,2].map(i=>P[k][i]+(P[Math.min(k+1,n-1)][i]-P[k][i])*f);
+  }
+  // sweep time: closest approach between ball surface and bat surface
+  function contactScan(flight, bat, t_c){
+    let best={d:1e9};
+    for(let tau=t_c-0.055; tau<=t_c+0.055; tau+=0.001){
+      const tb=tau-t_c; if(tb<bat.t[0]) continue;
+      const ballP=flight.pos(tau);
+      const sw=batStateAt(bat,tb);
+      const rhat=norm(sub(sw,bat.C));
+      const knobS=bat.R-SWEET_FROM_KNOB, headS=knobS+BAT_LEN;
+      const rel=sub(ballP,bat.C);
+      const s=Math.max(knobS, Math.min(headS, dot(rel,rhat)));
+      const cp=[bat.C[0]+s*rhat[0], bat.C[1]+s*rhat[1], bat.C[2]+s*rhat[2]];
+      const gap=Math.hypot(ballP[0]-cp[0],ballP[1]-cp[1],ballP[2]-cp[2])
+                - batRadiusAt(s-knobS) - BALL_R;
+      if(gap<best.d) best={d:gap, tau, u:s-knobS, dz:ballP[2]-cp[2], pt:cp.slice()};
+    }
+    return best;
   }
 
   // ---------- pitch sampling & flight ----------
@@ -207,7 +271,7 @@ const BUNDLE = __BUNDLE__;
     const tmax=t[N-1];
     for(let i=1;i<=EXT;i++){ pts.push(at(FT_ANG*i/EXT));       // follow-through
       t.push(tmax + (FT_ANG*R)*(i/EXT)/vc); }
-    return {pts, t:t.map(v=>v-tmax), contactIdx:N-1};
+    return {pts, t:t.map(v=>v-tmax), contactIdx:N-1, C, R};
   }
 
   // ---------- contact depth (fit on Statcast intercept data) ----------
@@ -279,14 +343,24 @@ const BUNDLE = __BUNDLE__;
     const target=flight.pos(t_c);
     const inZone=Math.abs(pt.plate[0])<=ZX && pt.plate[1]>=ZB && pt.plate[1]<=ZT;
     const pSwing=decisionProb(pt,h,p.throws,ct.balls,ct.strikes);
+    const cp=contactPredict(pt,h,p.throws,ct.balls,ct.strikes);
     const take=Math.random()>=pSwing;
-    const dzErr=randn()*(inZone?AIM_SD_IN:AIM_SD_OUT);
-    const whiff=!take && Math.abs(dzErr)>HIT_TOL;
-    const batContact=[target[0], y_c, target[2]+dzErr];
-    const bat=take?null:reconstructBat(m,batContact,h.stand);
-    const tEnd=(take||whiff)?flight.tAt(-2.0):t_c;
-    return {p,h,pt,flight,m,y_c,t_c,target,dzErr,whiff,take,pSwing,bat,tEnd,inZone,
-            missIn:Math.abs(dzErr)*12, squared:Math.abs(dzErr)<0.07};
+    if(take) return {p,h,pt,flight,m,y_c,t_c,target,take,pSwing,cp,bat:null,
+                     tEnd:flight.tAt(-2.0),inZone,whiff:false};
+    // contact model aims the barrel: mean vertical offset from the learned
+    // under/over bias field, spread solved to reproduce the model's P(whiff)
+    const muZ=-BIAS_S*cp.biasDeg;                // bias>0 (undercut) => bat below ball
+    const sg=solveSigma(muZ, cp.pWhiff);
+    const dz=muZ+sg*randn(), dx=0.22*randn();
+    const bat=reconstructBat(m,[target[0]+dx, y_c, target[2]+dz],h.stand);
+    // geometry decides: 34-in tapered bat vs regulation ball, swept over time
+    const scan=contactScan(flight,bat,t_c);
+    const whiff=scan.d>0;
+    const tEnd=whiff?flight.tAt(-2.0):scan.tau;
+    const spot = scan.u>2.62?'off the end': scan.u<1.35?'off the handle':
+                 Math.abs(scan.u-SWEET_FROM_KNOB)<0.29?'sweet spot':'barrel';
+    return {p,h,pt,flight,m,y_c,t_c,target,take,pSwing,bat,tEnd,inZone,whiff,
+            scan,spot,cp,missIn:Math.max(scan.d,0)*12,under:scan.dz>0};
   }
 
   // ---------- render loop ----------
@@ -297,18 +371,30 @@ const BUNDLE = __BUNDLE__;
   window.addEventListener('resize',resize); window.addEventListener('load',resize);
   if(window.ResizeObserver){ new ResizeObserver(resize).observe(sim); }
 
-  function drawBatUpTo(bat,k){
-    ctx.lineWidth=3.5; ctx.strokeStyle='rgba(242,145,61,.85)'; ctx.beginPath(); let started=false;
+  function drawSwing(bat,tb){
+    let k=0; while(k<bat.t.length-1 && bat.t[k+1]<=tb) k++;
+    ctx.lineWidth=2; ctx.strokeStyle='rgba(242,145,61,.45)'; ctx.beginPath(); let started=false;
     for(let i=0;i<=k;i++){const q=project(bat.pts[i]); if(!q){started=false;continue;}
       if(!started){ctx.moveTo(q.x,q.y);started=true;} else ctx.lineTo(q.x,q.y);} ctx.stroke();
-    ball(bat.pts[k],0.10,'#f2913d',true);
+    // the bat itself: 34 in along the radial axis, tapered handle -> barrel
+    const sw=batStateAt(bat,tb), rhat=norm(sub(sw,bat.C));
+    const knobS=bat.R-SWEET_FROM_KNOB;
+    const ptAt=s=>[bat.C[0]+s*rhat[0], bat.C[1]+s*rhat[1], bat.C[2]+s*rhat[2]];
+    const foc=cv.clientHeight*0.9;
+    ctx.lineCap='round';
+    [[0,0.83,0.039,'#c9955c'],[0.83,1.75,0.075,'#d69c55'],[1.75,BAT_LEN,0.108,'#e0a04f']]
+      .forEach(([u0,u1,r,col])=>{
+        const A=project(ptAt(knobS+u0)), Bq=project(ptAt(knobS+u1)); if(!A||!Bq)return;
+        ctx.strokeStyle=col; ctx.lineWidth=Math.max(1.5, foc*2*r/((A.z+Bq.z)/2));
+        ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(Bq.x,Bq.y); ctx.stroke();});
+    ctx.lineCap='butt';
   }
 
   function render(now){
     ctx.clearRect(0,0,cv.clientWidth,cv.clientHeight);
     drawField();
     const P=anim?play:expected;
-    if(P && !anim){ ball(P.flight.pos(P.flight.tR),0.12,'#eef3f7',true); }
+    if(P && !anim){ ball(P.flight.pos(P.flight.tR),BALL_R,'#eef3f7',true); }
     if(anim && P){
       const el=(now-anim.t0)/1000, prog=Math.min(el/DUR,1);
       const t = P.flight.tR + prog*(P.tEnd - P.flight.tR);
@@ -319,13 +405,9 @@ const BUNDLE = __BUNDLE__;
       ballTrail.forEach(q=>{const pr=project(q); if(!pr){st=false;return;}
         if(!st){ctx.moveTo(pr.x,pr.y);st=true;} else ctx.lineTo(pr.x,pr.y);}); ctx.stroke();
       const tb = t - P.t_c;
-      if(P.bat && tb >= P.bat.t[0]){
-        let k=0; while(k<P.bat.t.length-1 && P.bat.t[k+1] < tb) k++;
-        if(!P.whiff) k=Math.min(k,P.bat.contactIdx);
-        drawBatUpTo(P.bat,k);
-      }
-      if(!P.take && !P.whiff && done){ ball(P.target,0.17,'#ffffff',true); }
-      else ball(bp,0.12,'#eef3f7',true);
+      if(P.bat && tb >= P.bat.t[0]) drawSwing(P.bat, tb);
+      if(!P.take && !P.whiff && done){ ball(P.flight.pos(P.tEnd),0.17,'#ffffff',true); }
+      else ball(bp,BALL_R,'#eef3f7',true);
       if(done && el>DUR+1.2){ anim=null; go.disabled=false; }
     }
     requestAnimationFrame(render);
@@ -347,7 +429,7 @@ const BUNDLE = __BUNDLE__;
   [selT,selH,selC].forEach(s=>s.addEventListener('change',refresh));
 
   const fmt=(x,d)=>x.toFixed(d===undefined?1:d);
-  function showHUD(pt,m,inZone,pSwing){
+  function showHUD(pt,m,inZone,pSwing,pWhiff){
     const p=B.pitchers[+selP.value], h=B.hitters[+selH.value];
     document.getElementById('match').innerHTML = '<b>'+p.name+'</b> ('+p.throws+'HP) &nbsp;vs&nbsp; <b>'+h.name.replace(/,.*/,'')+'</b> ('+h.stand+'HH)';
     document.getElementById('velo').textContent=fmt(pt.speed);
@@ -358,7 +440,8 @@ const BUNDLE = __BUNDLE__;
       ['bat speed',fmt(m.bat_speed)+' mph'],['attack angle',fmt(m.attack_angle)+'°'],
       ['swing tilt',fmt(m.swing_path_tilt)+'°'],['attack dir',fmt(m.attack_direction)+'°'],
       ['swing length',fmt(m.swing_length)+' ft'],['contact depth',play?fmt(play.y_c)+' ft':'—'],
-      ['p(swing) @ '+selC.value, fmt(pSwing*100,0)+'%']
+      ['p(swing) @ '+selC.value, fmt(pSwing*100,0)+'%'],
+      ['p(whiff) if swung', fmt(pWhiff*100,0)+'%']
     ].map(([k,v])=>'<div class="cell"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>').join('');
   }
   function setOutcome(txt,cls){const o=document.getElementById('outcome'); o.textContent=txt; o.className='outcome '+cls;}
@@ -373,17 +456,17 @@ const BUNDLE = __BUNDLE__;
     play=null;
     const ct=getCount();
     showHUD(pt,mu,Math.abs(pt.plate[0])<=ZX && pt.plate[1]>=ZB && pt.plate[1]<=ZT,
-            decisionProb(pt,h,p.throws,ct.balls,ct.strikes));
+            decisionProb(pt,h,p.throws,ct.balls,ct.strikes),
+            contactPredict(pt,h,p.throws,ct.balls,ct.strikes).pWhiff);
     setOutcome('every pitch + swing is re-sampled — press PITCH','idle');
   }
 
   go.addEventListener('click',()=>{ if(anim)return;
     play=buildPlay(); ballTrail=[];
-    showHUD(Object.assign({label:(B.pitchers[+selP.value].pitches.find(q=>q.type===selT.value)||{}).label},play.pt), play.m, play.inZone, play.pSwing);
+    showHUD(Object.assign({label:(B.pitchers[+selP.value].pitches.find(q=>q.type===selT.value)||{}).label},play.pt), play.m, play.inZone, play.pSwing, play.cp.pWhiff);
     if(play.take) setOutcome('TAKE — '+(play.inZone?'called strike':'ball'),'take');
-    else if(play.whiff) setOutcome('WHIFF — '+(play.dzErr<0?'under the ball by ':'over the ball by ')+fmt(play.missIn)+' in','whiff');
-    else if(play.squared) setOutcome('CONTACT — squared up ('+fmt(play.missIn)+' in off center)','hit');
-    else setOutcome('CONTACT — off center by '+fmt(play.missIn)+' in','hit');
+    else if(play.whiff) setOutcome('WHIFF — '+(play.under?'under the ball by ':'over the ball by ')+fmt(play.missIn)+' in','whiff');
+    else setOutcome('CONTACT — '+play.spot,'hit');
     anim={t0:performance.now()}; go.disabled=true; });
 
   let drag=null;
